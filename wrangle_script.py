@@ -10,31 +10,35 @@ from configparser import ConfigParser
 import pyproj
 
 def calculate_statistics(old_df, new_df):
+    old_df['dt'] = old_df.groupby('id')['t'].diff().values
+    old_df = calculate_speed(old_df)
+    new_df = calculate_speed(new_df)
+    new_df_speed_by_leg = calculate_speed(new_df, 'leg_num')
     print("+++ CALCULATING STATISTICS +++")
     print("+++ ORIGINAL DATAFRAME +++")
     print(old_df.describe())
     print("+++ WRANGLED DATAFRAME +++")
     print(new_df.describe())
-    old_df = transform_time(old_df)
-    old_df['dt'] = old_df.groupby('id')['t'].diff().values
     show_percentage_of_rows_with_zero_diff_per_leg(old_df, 'id', "Raw dataframe groupby id")
     show_percentage_of_rows_with_zero_diff_per_leg(new_df, 'id', "Wrangled dataframe groupby id")
-    show_percentage_of_rows_with_zero_diff_per_leg(new_df, 'leg_num', 'Wrangled dataframe groupby leg id')
+    show_percentage_of_rows_with_zero_diff_per_leg(new_df_speed_by_leg, 'leg_num', 'Wrangled dataframe groupby leg id')
     show_distance_travelled_over_time(old_df, "Distance travelled over time with original dataframe")
     show_distance_travelled_over_time(new_df, "Distance travelled over time with modified dataframe")
-    show_distance_travelled_over_time(new_df,"Distance travelled over time with modified dataframe per leg of journey", groupby_id='leg_num')
+    show_distance_travelled_over_time(new_df_speed_by_leg,"Distance travelled over time with modified dataframe per leg of journey", groupby_id='leg_num')
     
 
 def show_distance_travelled_over_time(df, title, groupby_id='id'):
-    df['dlat_cum'] = df.groupby(groupby_id).lat.diff().abs().cumsum()
-    df['dlon_cum'] = df.groupby(groupby_id).lon.diff().abs().cumsum()
     df['dt_cum'] = df.groupby(groupby_id).dt.cumsum()
-    fig, (ax1, ax2) = plt.subplots(1,2)
-    for shipid in df.id.unique():
+    df['dist_cum'] = df.groupby(groupby_id).dist_m.cumsum()
+    print(df)
+    fig, (ax1, ax2, ax3) = plt.subplots(1,3)
+    for shipid in df[groupby_id].unique():
         color = tuple(np.random.rand(1,3)[0])
-        d = df[df.id==shipid]
-        ax1.plot(d.dt_cum, d.dlon_cum, '-', color=color); plt.xlabel('cumulative dt(sec)'); plt.ylabel('cumulative dx(m)'); 
-        ax2.plot(d.dt_cum, d.dlat_cum, '-', color=color); plt.xlabel('cumulative dt(sec)'); plt.ylabel('cumulative dy(m)'); 
+        d = df[df[groupby_id]==shipid]
+        ax1.plot(d.dt_cum, d.dlon, '-', color=color); ax1.set_xlabel('cumulative dt(sec)'); ax1.set_ylabel('delta distance in longitude(m)'); 
+        ax2.plot(d.dt_cum, d.dlat, '-', color=color); ax2.set_xlabel('cumulative dt(sec)'); ax2.set_ylabel('delta distance in latitude(m)'); 
+        ax3.plot(d.dt_cum, d.dist_cum, '-', color=color); ax3.set_xlabel('cumulative dt(sec)'); ax3.set_ylabel('cumulative distance(m)')
+    fig.suptitle(title)
     plt.show()
 
 def show_percentage_of_rows_with_zero_diff_per_leg(df, groupby_id, title):
@@ -79,10 +83,13 @@ def load_dataset():
     # Standardize column names
     df = df.rename(columns={args['id_column']:'id', args['lon_column']: 'lon', args['lat_column']: 'lat', args['time_column']:'t'})
     original_length = len(df)
+    # Change time to number
+    df = transform_time(df)
+    df = convert_coords_to_utm(df)
     logger.info("+++ ORIGINAL LENGTH: " + str(original_length) + "+++\n")
     return df
 
-def rename_and_drop_dublicates(df):
+def drop_dublicates(df):
     original_length = len(df)
     logger.info("+++ DROPPING ID/TIME DUBLICATES +++")
     args = dict(config_object['DATAFRAME'])
@@ -110,20 +117,18 @@ def drop_small_legs(df):
     return df
 
 def fix_values(df):
-    if int(config_object['WRANGLING']['fix_values']):
-        ship_legs = df.groupby('leg_num')
-        logger.info("+++ FIXING SPEED VALUES OUTLIERS +++")
-        logger.info("+++ TOTAL OF OUTLIERS: LAT-" + str(len(df[df.lat.isna()])) + " LON-" + str(len(df[df.lon.isna()])))
-        rolling_averages_lat = ship_legs.lat.rolling(10, min_periods=1, center=True).mean()
-        rolling_averages_lon = ship_legs.lon.rolling(10, min_periods=1, center=True).mean()
-        df.lat.fillna(rolling_averages_lat.reset_index(level=0)['lat'])
-        df.lon.fillna(rolling_averages_lon.reset_index(level=0)['lon'])
-        return df
-    else:
-        logger.info("+++ DROPPING SPEED VALUE OUTLIERS +++")
-        logger.info("+++ TOTAL OF OUTLIERS: LAT-" + str(len(df[df.lat.isna()])) + " LON-" + str(len(df[df.lon.isna()])))
-        df = df.dropna(subset=['lat', 'lon'], how='all')
-        return df
+    # Calculate the leg numbers for the original dataset. Drop small legs since they can not be fixed
+    df = drop_small_legs(df)
+    ship_legs = df.groupby('leg_num')
+    logger.info("+++ FIXING SPEED VALUES OUTLIERS +++")
+    logger.info("+++ TOTAL OF OUTLIERS: LAT-" + str(len(df[df.lat.isna()])) + " LON-" + str(len(df[df.lon.isna()])))
+    # Fix values using rolling averages
+    rolling_averages_lat = ship_legs.lat.rolling(10, min_periods=1, center=True).mean()
+    rolling_averages_lon = ship_legs.lon.rolling(10, min_periods=1, center=True).mean()
+    df.lat.fillna(rolling_averages_lat.reset_index(level=0)['lat'])
+    df.lon.fillna(rolling_averages_lon.reset_index(level=0)['lon'])
+    return df
+
 
 def transform_time(df):
     '''Change the time column to unix epoch. If the time is already in numeric format return it as is'''
@@ -134,14 +139,14 @@ def transform_time(df):
         df['t'] = df.t.apply(lambda x: abs(x.timestamp()))
     return df
     
-def calculate_speed(df):
+def calculate_speed(df, groupby_id = 'id'):
+    df = df.sort_values('t')
     # # Calculate speed of movement(in meters/sec) from one location to another
-    df['dt'] = (df['t'].groupby(df['id']).diff()).values  # Diff Time in seconds
-    df['dlon'] = (df['lon'].groupby(df['id']).diff()).values  # Diff Longitude in meters
-    df['dlat'] = (df['lat'].groupby(df['id']).diff()).values  # Diff Latitude in meters
+    df['dt'] = (df['t'].groupby(df[groupby_id]).diff()).values  # Diff Time in seconds
+    df['dlon'] = (df['lon'].groupby(df[groupby_id]).diff()).values  # Diff Longitude in meters
+    df['dlat'] = (df['lat'].groupby(df[groupby_id]).diff()).values  # Diff Latitude in meters
     df['dist_m'] = np.sqrt(df.dlon.values ** 2 + df.dlat.values ** 2)  # euclidean distance in meters
     df['speed'] = df['dist_m'] / df['dt']
-    #df['dspeed'] = (df['speed'].groupby(df['id']).diff()).values
     return df
 
 def remove_speed_outliers(df):
@@ -149,7 +154,6 @@ def remove_speed_outliers(df):
     # iterate this process until no rows are dropped 
     iterate_speed = True
     # Drop rows where the speed excedes the allowed value
-    df = df.sort_values('t')
     # Remove too fast entries
     df = calculate_speed(df)
     while iterate_speed:
@@ -172,7 +176,7 @@ def remove_speed_outliers(df):
     return df
 
 def convert_coords_to_utm(df):
-    myProj = pyproj.Proj("+proj=utm +zone=35N, +ellps=WGS84 +datum=WGS84 +units=m +no_defs")
+    myProj = pyproj.Proj(init='epsg:3857')
     lon2, lat2 = myProj(df['lon'].values, df['lat'].values)
     df.update(pd.DataFrame({'lon': lon2, 'lat': lat2}))
     return df
@@ -185,19 +189,18 @@ def wrangle_dataset(df):
         Y = np.cos(lat) * np.sin(df.loc[lat.index, 'lat_prev']) - np.sin(lat) * np.cos(df.loc[lat.index, 'lat_prev']) * np.cos(dlon)
         return np.degrees(np.arctan2(X,Y))
     original_length=len(df)
-    df = rename_and_drop_dublicates(df)
-    if int(config_object['WRANGLING']['convert_to_utm']):
-        df = convert_coords_to_utm(df)
-    df = transform_time(df)
+    original_df = df.copy()
+    df = drop_dublicates(df)
     # Remove rows where the speed is above or under threshold defined in config 
     df = remove_speed_outliers(df)
-    print(len(df))
-    print(df)
     # Differentiate the legs
     df = drop_small_legs(df)
-    print(len(df))
-    print(df)
-    #df = fix_values(df)
+    if int(config_object['WRANGLING']['fix_values']):
+        # get the indices that have changed during wrangling process
+        diff_indices = original_df.index.difference(df.index)
+        original_df.loc[list(diff_indices), 'lat'] = np.nan
+        original_df.loc[list(diff_indices), 'lon'] = np.nan
+        df = fix_values(original_df)
     '''
     if bearing:
         df['bearing'] = df.groupby('leg_num')['lat'].apply(calculate_bearing)
@@ -222,4 +225,5 @@ raw_dataframe = load_dataset()
 fixed_dataframe = wrangle_dataset(raw_dataframe)
 if cli_args['statistics']:
     calculate_statistics(raw_dataframe, fixed_dataframe)
-#fixed_dataframe.to_csv("out_" + config_object['DATAFRAME']['filepath'])
+fixed_dataframe.to_csv("out_ais.csv") #+ config_object['DATAFRAME']['filepath'])
+
